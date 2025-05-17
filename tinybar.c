@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include <X11/Xatom.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
@@ -9,29 +11,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define COMMAND_WIDGET(name, width, interval, font, font_size, command)        \
-    void name(char *buf, int *fg, int *bg) {                                   \
-        FILE *fp = popen(command, "r");                                        \
-        if (!fp) {                                                             \
-            perror("popen");                                                   \
-            return;                                                            \
-        }                                                                      \
-        fgets(buf, 256, fp);                                                   \
-        pclose(fp);                                                            \
-    }                                                                          \
-    static const Widget name##_widget = {.width = width,                       \
-                                         .callback = name,                     \
-                                         .interval = interval,                 \
-                                         .font = font,                         \
-                                         .font_size = font_size}
-
-// -------------- CONFIG STARTS --------------
-
 typedef struct Widget {
     int width;
 
+    int border_width;
+
     // callback
-    void (*callback)(char *buf, int *fg, int *bg);
+    void (*callback)(char *buf, int *fg, int *bg, int *border);
 
     // update interval in ms (0 for no update)
     int interval;
@@ -39,43 +25,64 @@ typedef struct Widget {
     const char *font;
     int font_size;
 
+    // padding between widgets
+    int padding;
+
 } Widget;
 
-#define BAR_HEIGHT 20
+// -------------- CONFIG STARTS --------------
+
+#define BAR_HEIGHT 40
 #define WIDGETS 3
 #define BACKGROUND 0x123456
+#define FOREGROUND 0xFFFFFF
+#define BORDER 0xFF0000
+#define PADDING 0
+#define FONT_SIZE 12
+#define FONT "Classic Console"
+#define BORDER_WIDTH 2
 
-void get_time(char *buf, int *fg, int *bg) {
+void get_time(char *buf, int *_fg, int *_bg, int *_border) {
+    (void)_fg;
+    (void)_bg;
+    (void)_border;
+
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
     strftime(buf, 64, "%H:%M:%S", tm);
 }
 
-void get_date(char *buf, int *fg, int *bg) {
+void get_date(char *buf, int *_fg, int *_bg, int *_border) {
+    (void)_fg;
+    (void)_bg;
+    (void)_border;
+
     time_t t = time(NULL);
     struct tm *tm = localtime(&t);
     strftime(buf, 64, "%Y-%m-%d", tm);
 }
 
-void get_battery(char *buf, int *fg, int *bg) {
+void get_battery(char *buf, int *_fg, int *_bg, int *border) {
+    (void)_fg;
+    (void)_bg;
+
     FILE *fp = fopen("/sys/class/power_supply/BAT0/capacity", "r");
     if (!fp) {
         perror("fopen");
         return;
     }
-    
+
     char buf2[64];
     fgets(buf2, sizeof(buf2), fp);
 
     int capacity = atoi(buf2);
     if (capacity < 20) {
-        *fg = 0xFF0000; // red
+        *border = 0xFF0000; // red
     } else if (capacity < 50) {
-        *fg = 0xFFFF00; // yellow
+        *border = 0xFFFF00; // yellow
     } else {
-        *fg = 0x00FF00; // green
+        *border = 0x00FF00; // green
     }
-    *bg = BACKGROUND;
     snprintf(buf, 64, "Battery: %d%%", capacity);
 
     fclose(fp);
@@ -84,19 +91,14 @@ void get_battery(char *buf, int *fg, int *bg) {
 Widget widgets[WIDGETS] = {
     {.width = 8,
      .callback = get_time,
-     .interval = 1000,
-     .font = "JetBrains Mono",
-     .font_size = 12},
+     .interval = 1000},
     {.width = 8,
      .callback = get_date,
-     .interval = 1000,
-     .font = "JetBrains Mono",
-     .font_size = 12},
-    {.width = 12,
+     .interval = 1000,},
+    {.width = 13,
      .callback = get_battery,
      .interval = 60000,
-     .font = "JetBrains Mono",
-     .font_size = 12},
+     .border_width = 3},
 };
 
 // -------------- CONFIG ENDS --------------
@@ -208,7 +210,11 @@ int main() {
             }
             fonts[i] = font;
         } else {
-            fonts[i] = XftFontOpenName(d, screen, "monospace:size=12");
+            // Load default font
+            char font_str[256];
+            snprintf(font_str, sizeof(font_str), "%s:size=%d", FONT, FONT_SIZE);
+
+            fonts[i] = XftFontOpenName(d, screen, font_str);
             if (!fonts[i]) {
                 die("Failed to load default font\n");
             }
@@ -230,16 +236,9 @@ int main() {
                 }
             }
 
-            int fg = 0, bg = BACKGROUND;
-            widgets[i].callback(buf, &fg, &bg);
-            printf("Widget %d: %s\n", i, buf);
-            XSetForeground(d, gc, fg);
+            int fg = FOREGROUND, bg = BACKGROUND, border = BACKGROUND;
+            widgets[i].callback(buf, &fg, &bg, &border);
             XSetBackground(d, gc, bg);
-
-            // parse in colors from fg and bg
-            int r = (fg >> 16) & 0xFF;
-            int g = (fg >> 8) & 0xFF;
-            int b = fg & 0xFF;
 
             // Allocate Xft color
             XRenderColor xr = {.red = (fg >> 16 & 0xFF) * 257,
@@ -251,35 +250,69 @@ int main() {
                                &xr, &color);
 
             XftFont *font = fonts[i];
+
+            // Before filling rectangle, draw border rectangle
+            XSetForeground(d, gc, border); // set border color
+
+            int border_width =
+                widgets[i].border_width > 0 ? widgets[i].border_width : BORDER_WIDTH;
+
             for (int j = 0; j < bar_count; j++) {
                 Window w = bars[j];
 
-                XSetForeground(d, gc, bg);
-
-                XGlyphInfo extents;
-                XftTextExtentsUtf8(d, font, (FcChar8 *)buf, strlen(buf),
-                                   &extents);
-
-                int x = cur_x + ((widgets[i].width * widgets[i].font_size) -
-                                 extents.width) /
-                                    2;
-                int y = BAR_HEIGHT / 2 + extents.height / 2;
-
-                XFillRectangle(d, w, gc, x, 0,
-                               (widgets[i].width * widgets[i].font_size),
+                // first, draw the border
+                XSetForeground(d, gc, border);
+                XSetBackground(d, gc, border);
+                XFillRectangle(d, w, gc, cur_x, 0,
+                               (widgets[i].width * font->max_advance_width),
                                BAR_HEIGHT);
 
-                XftDraw *draw = XftDrawCreate(d, w, DefaultVisual(d, 0),
-                                              DefaultColormap(d, 0));
+                // then, draw the background
+                XSetForeground(d, gc, bg);
+                XSetBackground(d, gc, bg);
+                XFillRectangle(d, w, gc, cur_x + border_width, border_width,
+                               (widgets[i].width * font->max_advance_width) -
+                                   border_width * 2,
+                               BAR_HEIGHT - border_width * 2);
 
-                XftDrawStringUtf8(draw, &color, font, x, y, (FcChar8 *)buf,
-                                  strlen(buf));
+                XGlyphInfo extents;
+                XftTextExtentsUtf8(d, font, (const FcChar8 *)buf, strlen(buf),
+                                   &extents);
+
+                int text_width = extents.xOff;
+                int text_height = font->ascent + font->descent;
+
+                printf("text width: %d\n", text_width);
+                printf("text height: %d\n", text_height);
+
+                int widget_width = widgets[i].width * font->max_advance_width;
+                int text_x = cur_x + border_width +
+                             (widget_width - 2 * border_width - text_width) / 2;
+                int text_y = border_width + font->ascent +
+                             (BAR_HEIGHT - 2 * border_width - text_height) / 2;
+
+                XftDraw *draw = XftDrawCreate(d, w, DefaultVisual(d, screen),
+                                              DefaultColormap(d, screen));
+                XftDrawStringUtf8(draw, &color, font, text_x, text_y,
+                                  (const FcChar8 *)buf, strlen(buf));
                 XftDrawDestroy(draw);
             }
 
             XFlush(d);
 
-            cur_x += (widgets[i].width * widgets[i].font_size);
+            int font_size = widgets[i].font_size > 0
+                                ? widgets[i].font_size
+                                : FONT_SIZE;
+            printf("font size: %d\n", font_size);
+
+            cur_x += (widgets[i].width * font_size);
+            if (i + 1 < WIDGETS) {
+                int pad = widgets[i].padding > 0
+                              ? widgets[i].padding
+                              : PADDING;
+                printf("padding: %d\n", pad);
+                cur_x += pad;
+            }
         }
         usleep(shortest_interval * 1000);
         XFlush(d);
